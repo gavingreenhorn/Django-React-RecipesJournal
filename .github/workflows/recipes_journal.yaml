@@ -1,0 +1,144 @@
+name: recipes journal workflow
+
+on: [push]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10"]
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python 
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: | 
+          python -m pip install --upgrade pip 
+          pip install flake8 pep8-naming flake8-broken-line flake8-return
+          pip install -r backend/requirements.txt 
+      - name: Test with flake8
+        run: |
+          python -m flake8
+
+  # build backend and frontend images, push them to docker hub
+  build_and_push_to_docker_hub:
+    name: push docker images to docker hub
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+    
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to Docker 
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }} 
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push backend
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          no-cache: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/foodgram_backend:v1.0
+          file: backend/Dockerfile
+
+      - name: Push frontend
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          no-cache: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/foodgram_frontend:v1.0
+          file: frontend/Dockerfile 
+
+  # move configs and static data to remote host
+  move_data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+
+      - name: Copy nginx conf
+        uses: garygrossgarten/github-action-scp@release
+        with:
+          local: infra/nginx.conf
+          remote: nginx/foodgram.conf
+          rmRemote: true
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          privateKey: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+
+      - name: Copy compose file
+        uses: garygrossgarten/github-action-scp@release
+        with:
+          local: infra/docker-compose.yml
+          remote: foodgram_compose.yaml
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          privateKey: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+  
+  # setup remote environment, deploy containers, initialize the app
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: /home/${{ secrets.USER }}/foodgram_compose.yaml
+    needs: [build_and_push_to_docker_hub, move_data]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: executing remote ssh commands to deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+          script: |
+            if which docker &> /dev/null; then
+              echo "docker already installed, skipping installation";
+            else
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sh get-docker.sh
+            fi
+
+            sudo docker compose -f ${{ env.COMPOSE_FILE }} down -v
+            sudo docker system prune -af
+            
+            :> .env
+            chmod 640 .env
+            echo DOCKER_USERNAME=${{secrets.DOCKER_USERNAME}} >> .env
+            echo NGINX_HOST=${{ secrets.HOST }} >> .env
+            echo DB_ENGINE=${{ secrets.DB_ENGINE }} >> .env
+            echo DB_NAME=${{ secrets.DB_NAME }} >> .env
+            echo DB_HOST=${{ secrets.DB_HOST }} >> .env
+            echo DB_PORT=${{ secrets.DB_PORT }} >> .env
+            echo POSTGRES_USER=${{ secrets.POSTGRES_USER }} >> .env
+            echo POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }} >> .env
+            
+            sudo docker compose -f ${{ env.COMPOSE_FILE }} up -d
+
+            sudo docker exec foodgram_backend python manage.py makemigrations
+            sudo docker exec foodgram_backend python manage.py migrate --verbosity 2
+            sudo docker exec foodgram_backend python manage.py collectstatic --no-input
+            sudo docker exec foodgram_backend python manage.py flush --no-input
+            sudo docker exec foodgram_backend python manage.py loadcsv users FoodgramUser
+            sudo docker exec foodgram_backend python manage.py loadcsv tags Tag
+            sudo docker exec foodgram_backend python manage.py loadcsv ingredients Ingredient
+            sudo docker exec foodgram_backend python manage.py make_relations
+
+            sudo docker exec foodgram_backend python manage.py createsuperuser \
+            --username ${{ secrets.SU_NAME }} \
+            --email ${{ secrets.SU_EMAIL }} \
+            --password ${{ secrets.SU_PASSWORD }} \
+            --first_name John \
+            --last_name Doe \
+            --no-input
